@@ -85,7 +85,6 @@ class ReactAgent:
         system_llm: Callable[[LLMRequest], LLMResponse] | None = None,
         on_action: Callable | None = None,  # Callable[[ActionEvent], None]
         action_log: "IO | None" = None,
-        completion_validator: Callable[[list[ActionRecord], str], str | None] | None = None,
     ) -> None:
         self.system_prompt = system_prompt
         self.actions = actions
@@ -97,7 +96,6 @@ class ReactAgent:
         self.system_llm = system_llm
         self.on_action = on_action
         self.action_log = action_log
-        self.completion_validator = completion_validator
         self._actions_by_name: dict[str, Action] = {a.name: a for a in actions}
 
     def _build_tools(self) -> list[dict] | None:
@@ -134,26 +132,6 @@ class ReactAgent:
                 },
             })
         return tools
-
-    def _validate_completion(self, action_history: list[ActionRecord], text: str, messages: list[dict]) -> bool:
-        """Validate agent's claim of completion. Returns True if done.
-
-        If completion_validator is set, calls it. The validator returns None
-        to accept, or a rejection message string to continue.
-        If no validator, accepts unconditionally.
-        """
-        if not self.completion_validator or not action_history:
-            return True
-
-        rejection = self.completion_validator(action_history, text)
-        if rejection is None:
-            return True
-
-        # Rejected — inject continue message
-        logger.info("  Completion rejected: %s", rejection[:100])
-        messages.append({"role": "assistant", "content": text or "I'm done."})
-        messages.append({"role": "user", "content": rejection})
-        return False
 
     def run(self, context: str | None = None) -> AgentResult:
         iterations = 0
@@ -215,21 +193,45 @@ class ReactAgent:
                     for tc in response.tool_calls
                 )
                 if all_unknown:
+                    # Model called non-existent tools (e.g. "finish") — treat as done claim
                     logger.info(
                         "  [iter %d] Unknown tool(s): %s — treating as text response",
                         iterations,
                         ", ".join(tc.name for tc in response.tool_calls),
                     )
                     text = response.content or response.tool_calls[0].arguments.get("result", "")
-                    if self._validate_completion(action_history, text, messages):
+                    if self.system_llm and action_history:
+                        from llm_agent_toolkit.stdlib.step_judge import StepJudge
+                        judge = StepJudge(self.system_llm)
+                        trace = StepJudge.format_trace_for_judge(action_history, len(action_history))
+                        verdict = judge.validate_completion(
+                            goal="Fix the issue described in the task",
+                            trace=trace,
+                            agent_message=text,
+                        )
+                        if verdict.done:
+                            logger.info("  Judge ACCEPT at iter %d: %s", iterations, verdict.reason[:100])
+                            return AgentResult(
+                                output=text,
+                                iterations=iterations,
+                                termination_reason="done",
+                                action_history=action_history,
+                            )
+                        else:
+                            logger.info("  Judge REJECT at iter %d: %s", iterations, verdict.reason[:100])
+                            messages.append({"role": "assistant", "content": text or "I'm done."})
+                            messages.append({"role": "user", "content": (
+                                "You haven't completed the task yet. "
+                                "Continue working on the issue — use tools to make progress."
+                            )})
+                            continue
+                    else:
                         return AgentResult(
                             output=text,
                             iterations=iterations,
                             termination_reason="done",
                             action_history=action_history,
                         )
-                    else:
-                        continue
 
                 for tool_call in response.tool_calls:
                     action = self._actions_by_name.get(tool_call.name)
@@ -290,7 +292,7 @@ class ReactAgent:
                     # Add tool result message
                     tool_content = result
                     if self.balance_provider is not None:
-                        tool_content += f"\n[Balance: {self.balance_provider()}]"
+                        tool_content += f"\n[当前余额: {self.balance_provider()}]"
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -317,15 +319,41 @@ class ReactAgent:
                             messages.insert(0, {"role": "system", "content": self.system_prompt})
             elif response.content:
                 # Text response without tool calls — agent claims done.
+                # Use judge to validate if system_llm is available.
                 logger.info("  [iter %d] Text response (claim done): %s", iterations, response.content[:200])
-                if self._validate_completion(action_history, response.content, messages):
+
+                if self.system_llm and action_history:
+                    from llm_agent_toolkit.stdlib.step_judge import StepJudge
+                    judge = StepJudge(self.system_llm)
+                    trace = StepJudge.format_trace_for_judge(action_history, len(action_history))
+                    verdict = judge.validate_completion(
+                        goal="Fix the issue described in the task",
+                        trace=trace,
+                        agent_message=response.content,
+                    )
+                    if verdict.done:
+                        logger.info("  Judge ACCEPT at iter %d: %s", iterations, verdict.reason[:100])
+                        return AgentResult(
+                            output=response.content,
+                            iterations=iterations,
+                            termination_reason="done",
+                            action_history=action_history,
+                        )
+                    else:
+                        logger.info("  Judge REJECT at iter %d: %s", iterations, verdict.reason[:100])
+                        messages.append({"role": "assistant", "content": response.content})
+                        messages.append({"role": "user", "content": (
+                            "You haven't completed the task yet. "
+                            "Continue working on the issue — use tools to make progress."
+                        )})
+                else:
+                    # No judge available — trust the agent
                     return AgentResult(
                         output=response.content,
                         iterations=iterations,
                         termination_reason="done",
                         action_history=action_history,
                     )
-                # else: validator injected continue message, loop continues
             else:
                 # Completely empty response — terminate.
                 return AgentResult(

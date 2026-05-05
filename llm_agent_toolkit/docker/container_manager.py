@@ -54,7 +54,6 @@ class ContainerManager:
         # Start container in background
         cmd = [
             "docker", "run", "-d",
-            "--platform", "linux/amd64",
             "-w", container_workspace,
         ]
         if host_workspace is not None:
@@ -107,7 +106,7 @@ class ContainerManager:
         if check.returncode != 0:
             logger.info("Pulling image %s ...", image)
             pull = subprocess.run(
-                ["docker", "pull", "--platform", "linux/amd64", image],
+                ["docker", "pull", image],
                 capture_output=True,
                 text=True,
                 timeout=600,
