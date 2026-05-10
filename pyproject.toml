@@ -7,7 +7,7 @@ packages = [{include = "llm_agent_toolkit"}]
 
 [tool.poetry.dependencies]
 python = "^3.11"
-litellm = "^1.0"
+litellm = ">=1.83.7"
 swebench = {version = "^3.0", optional = true}
 
 [tool.poetry.extras]
